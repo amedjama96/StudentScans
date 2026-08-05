@@ -1,25 +1,18 @@
-export default function App() {
-  return (
-    <main className="page">
-      <section className="hero">
-        <span className="badge">Student project • Day 2</span>
-        <h1>StudentScans</h1>
-        <p className="lead">
-          Check the basic external security posture of a website.
-        </p>
 
-        <div className="coming-soon">
-          <h2>Coming next</h2>
-          <ul>
-            <li>Domain input</li>
-            <li>Security scan</li>
-            <li>Security score</li>
-            <li>Recommendations</li>
-          </ul>
-        </div>
-
-        <button disabled>Scan coming tomorrow</button>
-      </section>
-    </main>
-  );
+import { useState } from "react";
+export default function App(){
+ const [domain,setDomain]=useState("");
+ const [message,setMessage]=useState("");
+ function startScan(){
+  if(!domain.trim()){setMessage("Please enter a domain.");return;}
+  setMessage(`Ready to scan ${domain} (coming in Day 4).`);
+ }
+ return <main className="page"><section className="hero">
+ <span className="badge">Student project • Day 3</span>
+ <h1>StudentScans</h1>
+ <p className="lead">Enter a website to prepare for a basic security scan.</p>
+ <input className="domain-input" placeholder="example.com" value={domain} onChange={e=>setDomain(e.target.value)}/>
+ <button onClick={startScan}>Start scan</button>
+ {message&&<p className="status">{message}</p>}
+ </section></main>
 }

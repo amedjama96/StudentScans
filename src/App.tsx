@@ -1,43 +1,109 @@
 import { useState } from "react";
 
 type ScanStatus = "idle" | "scanning" | "complete";
+type HttpsStatus = "pending" | "checking" | "reachable" | "unconfirmed";
 
-const checks = ["HTTPS", "Security Headers", "DNS", "SPF", "DMARC"];
+function normalizeDomain(value: string): string {
+  return value.trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase();
+}
+
+async function checkHttps(domain: string): Promise<HttpsStatus> {
+  try {
+    await fetch(`https://${domain}`, {
+      method: "GET",
+      mode: "no-cors",
+      cache: "no-store",
+    });
+    return "reachable";
+  } catch {
+    return "unconfirmed";
+  }
+}
 
 export default function App() {
   const [domain, setDomain] = useState("");
+  const [scannedDomain, setScannedDomain] = useState("");
   const [message, setMessage] = useState("");
   const [status, setStatus] = useState<ScanStatus>("idle");
   const [progress, setProgress] = useState(0);
+  const [httpsStatus, setHttpsStatus] = useState<HttpsStatus>("pending");
 
-  function startScan() {
-    const cleanedDomain = domain.trim();
+  async function startScan() {
+    const cleanedDomain = normalizeDomain(domain);
 
-    if (!cleanedDomain) {
-      setMessage("Please enter a domain.");
+    if (!cleanedDomain || !cleanedDomain.includes(".")) {
+      setMessage("Please enter a valid domain, such as example.com.");
       return;
     }
 
     setMessage("");
+    setScannedDomain(cleanedDomain);
     setStatus("scanning");
-    setProgress(0);
+    setProgress(15);
+    setHttpsStatus("checking");
 
-    [20, 40, 60, 80, 100].forEach((value, index) => {
-      window.setTimeout(() => {
-        setProgress(value);
+    window.setTimeout(() => setProgress(40), 350);
 
-        if (value === 100) {
-          setStatus("complete");
-        }
-      }, (index + 1) * 450);
-    });
+    const result = await checkHttps(cleanedDomain);
+
+    setProgress(75);
+    setHttpsStatus(result);
+
+    window.setTimeout(() => {
+      setProgress(100);
+      setStatus("complete");
+    }, 500);
   }
 
   function resetScan() {
     setStatus("idle");
     setProgress(0);
     setMessage("");
+    setHttpsStatus("pending");
+    setScannedDomain("");
   }
+
+  const httpsLabel =
+    httpsStatus === "reachable"
+      ? "Reachable"
+      : httpsStatus === "unconfirmed"
+        ? "Could not confirm"
+        : httpsStatus === "checking"
+          ? "Checking"
+          : "Pending";
+
+  const checks = [
+    {
+      name: "HTTPS",
+      description:
+        httpsStatus === "reachable"
+          ? "The website responded to a basic HTTPS connection attempt."
+          : httpsStatus === "unconfirmed"
+            ? "The browser could not confirm a basic HTTPS connection."
+            : "Checking whether the website can be reached over HTTPS.",
+      status: httpsLabel,
+    },
+    {
+      name: "Security Headers",
+      description: "This check will be connected in a later version.",
+      status: "Pending",
+    },
+    {
+      name: "DNS",
+      description: "This check will be connected in a later version.",
+      status: "Pending",
+    },
+    {
+      name: "SPF",
+      description: "This check will be connected in a later version.",
+      status: "Pending",
+    },
+    {
+      name: "DMARC",
+      description: "This check will be connected in a later version.",
+      status: "Pending",
+    },
+  ];
 
   return (
     <main className="page">
@@ -58,7 +124,11 @@ export default function App() {
             disabled={status === "scanning"}
             onChange={(event) => setDomain(event.target.value)}
           />
-          <button type="button" onClick={startScan} disabled={status === "scanning"}>
+          <button
+            type="button"
+            onClick={() => void startScan()}
+            disabled={status === "scanning"}
+          >
             {status === "scanning" ? "Scanning..." : "Start scan"}
           </button>
         </div>
@@ -66,19 +136,18 @@ export default function App() {
         {message && <p className="error-message">{message}</p>}
 
         {status === "scanning" && (
-          <section className="scan-panel" aria-live="polite">
+          <section className="scan-panel">
             <div className="scan-heading">
-              <h2>Scanning {domain.trim()}</h2>
+              <h2>Scanning {scannedDomain}</h2>
               <span>{progress}%</span>
             </div>
             <div className="progress-track">
               <div className="progress-bar" style={{ width: `${progress}%` }} />
             </div>
             <p className="scan-step">
-              {progress < 40 && "Checking connection..."}
-              {progress >= 40 && progress < 60 && "Preparing HTTPS check..."}
-              {progress >= 60 && progress < 80 && "Preparing DNS checks..."}
-              {progress >= 80 && "Preparing results..."}
+              {progress < 40 && "Starting scan..."}
+              {progress >= 40 && progress < 75 && "Checking HTTPS reachability..."}
+              {progress >= 75 && "Preparing results..."}
             </p>
           </section>
         )}
@@ -88,21 +157,28 @@ export default function App() {
             <div className="results-heading">
               <div>
                 <p className="section-label">Scan complete</p>
-                <h2>{domain.trim()}</h2>
+                <h2>{scannedDomain}</h2>
               </div>
               <button type="button" className="secondary-button" onClick={resetScan}>
                 New scan
               </button>
             </div>
 
+            <p className="notice">
+              StudentScans currently performs a basic HTTPS reachability check.
+              It does not inspect certificates, cipher suites, or vulnerabilities.
+            </p>
+
             <div className="check-list">
               {checks.map((check) => (
-                <article className="check-card" key={check}>
+                <article className="check-card" key={check.name}>
                   <div>
-                    <h3>{check}</h3>
-                    <p>Security check will be connected in a later version.</p>
+                    <h3>{check.name}</h3>
+                    <p>{check.description}</p>
                   </div>
-                  <span className="pending-status">Pending</span>
+                  <span className={`check-status ${check.status.toLowerCase().replaceAll(" ", "-")}`}>
+                    {check.status}
+                  </span>
                 </article>
               ))}
             </div>

@@ -1,270 +1,160 @@
 import { useState } from "react";
 
-type ScanStatus = "idle" | "scanning" | "complete";
-type CheckState = "pending" | "checking" | "success" | "warning";
+type State = "pending" | "checking" | "success" | "warning";
 
-type DnsResult = {
-  ipv4: string[];
-  mailServers: string[];
-};
-
-function normalizeDomain(value: string): string {
-  return value
-    .trim()
-    .replace(/^https?:\/\//i, "")
-    .replace(/\/.*$/, "")
-    .toLowerCase();
+function cleanDomain(value: string) {
+  return value.trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase();
 }
 
-async function checkHttps(domain: string): Promise<CheckState> {
+async function dnsQuery(domain: string, type: "A" | "MX" | "TXT") {
+  const response = await fetch(
+    `https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=${type}`
+  );
+  if (!response.ok) throw new Error("DNS lookup failed");
+  return response.json();
+}
+
+async function httpsCheck(domain: string): Promise<State> {
   try {
-    await fetch(`https://${domain}`, {
-      method: "GET",
-      mode: "no-cors",
-      cache: "no-store",
-    });
+    await fetch(`https://${domain}`, { mode: "no-cors", cache: "no-store" });
     return "success";
   } catch {
     return "warning";
   }
 }
 
-async function queryDns(domain: string, type: "A" | "MX") {
-  const response = await fetch(
-    `https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=${type}`,
-  );
-
-  if (!response.ok) {
-    throw new Error("DNS request failed");
-  }
-
-  return response.json();
-}
-
-async function checkDns(domain: string): Promise<DnsResult> {
-  const [aData, mxData] = await Promise.all([
-    queryDns(domain, "A"),
-    queryDns(domain, "MX"),
-  ]);
-
-  const ipv4 =
-    aData.Answer?.filter((answer: { type: number }) => answer.type === 1).map(
-      (answer: { data: string }) => answer.data,
-    ) ?? [];
-
-  const mailServers =
-    mxData.Answer?.filter((answer: { type: number }) => answer.type === 15).map(
-      (answer: { data: string }) => answer.data,
-    ) ?? [];
-
-  return { ipv4, mailServers };
-}
-
 export default function App() {
-  const [domain, setDomain] = useState("");
-  const [scannedDomain, setScannedDomain] = useState("");
-  const [message, setMessage] = useState("");
-  const [status, setStatus] = useState<ScanStatus>("idle");
-  const [progress, setProgress] = useState(0);
-
-  const [httpsStatus, setHttpsStatus] = useState<CheckState>("pending");
-  const [dnsStatus, setDnsStatus] = useState<CheckState>("pending");
-  const [dnsResult, setDnsResult] = useState<DnsResult>({ ipv4: [], mailServers: [] });
+  const [domain,setDomain]=useState("");
+  const [target,setTarget]=useState("");
+  const [message,setMessage]=useState("");
+  const [scanning,setScanning]=useState(false);
+  const [complete,setComplete]=useState(false);
+  const [progress,setProgress]=useState(0);
+  const [https,setHttps]=useState<State>("pending");
+  const [dns,setDns]=useState<State>("pending");
+  const [spf,setSpf]=useState<State>("pending");
+  const [ips,setIps]=useState<string[]>([]);
+  const [mx,setMx]=useState<string[]>([]);
+  const [spfRecord,setSpfRecord]=useState("");
 
   async function startScan() {
-    const cleanedDomain = normalizeDomain(domain);
-
-    if (!cleanedDomain || !cleanedDomain.includes(".")) {
+    const d=cleanDomain(domain);
+    if(!d || !d.includes(".")){
       setMessage("Please enter a valid domain, such as example.com.");
       return;
     }
 
-    setMessage("");
-    setScannedDomain(cleanedDomain);
-    setStatus("scanning");
-    setProgress(10);
-    setHttpsStatus("checking");
-    setDnsStatus("checking");
-    setDnsResult({ ipv4: [], mailServers: [] });
+    setMessage(""); setTarget(d); setScanning(true); setComplete(false); setProgress(10);
+    setHttps("checking"); setDns("checking"); setSpf("checking");
+    setIps([]); setMx([]); setSpfRecord("");
 
-    const httpsPromise = checkHttps(cleanedDomain);
-    setProgress(30);
+    const hp=httpsCheck(d);
+    setProgress(25);
 
-    const dnsPromise = checkDns(cleanedDomain)
-      .then((result) => {
-        setDnsResult(result);
-        setDnsStatus(result.ipv4.length > 0 ? "success" : "warning");
-      })
-      .catch(() => setDnsStatus("warning"));
+    try {
+      const [aData,mxData,txtData]=await Promise.all([
+        dnsQuery(d,"A"), dnsQuery(d,"MX"), dnsQuery(d,"TXT")
+      ]);
 
-    setProgress(55);
+      const foundIps=(aData.Answer ?? [])
+        .filter((x:{type:number})=>x.type===1)
+        .map((x:{data:string})=>x.data);
 
-    const httpsResult = await httpsPromise;
-    setHttpsStatus(httpsResult);
-    setProgress(75);
+      const foundMx=(mxData.Answer ?? [])
+        .filter((x:{type:number})=>x.type===15)
+        .map((x:{data:string})=>x.data);
 
-    await dnsPromise;
-    setProgress(90);
+      setIps(foundIps); setMx(foundMx);
+      setDns(foundIps.length ? "success" : "warning");
+      setProgress(60);
 
-    window.setTimeout(() => {
-      setProgress(100);
-      setStatus("complete");
-    }, 450);
+      const records:string[]=(txtData.Answer ?? [])
+        .filter((x:{type:number})=>x.type===16)
+        .map((x:{data:string})=>x.data.replace(/^"|"$/g,""));
+
+      const found=records.find(x=>x.toLowerCase().startsWith("v=spf1")) ?? "";
+      setSpfRecord(found);
+      setSpf(found ? "success" : "warning");
+    } catch {
+      setDns("warning"); setSpf("warning");
+    }
+
+    setProgress(80);
+    setHttps(await hp);
+    setProgress(100);
+    setScanning(false);
+    setComplete(true);
   }
 
-  function resetScan() {
-    setStatus("idle");
-    setProgress(0);
-    setMessage("");
-    setHttpsStatus("pending");
-    setDnsStatus("pending");
-    setDnsResult({ ipv4: [], mailServers: [] });
-    setScannedDomain("");
+  function reset(){
+    setComplete(false); setProgress(0); setMessage("");
+    setHttps("pending"); setDns("pending"); setSpf("pending");
+    setIps([]); setMx([]); setSpfRecord("");
   }
 
-  function statusLabel(state: CheckState) {
-    if (state === "success") return "Found";
-    if (state === "warning") return "Could not confirm";
-    if (state === "checking") return "Checking";
-    return "Pending";
-  }
+  const label=(s:State, success="Found") =>
+    s==="success" ? success : s==="warning" ? "Not found" : s==="checking" ? "Checking" : "Pending";
 
-  const checks = [
-    {
-      name: "HTTPS",
-      description:
-        httpsStatus === "success"
-          ? "The website responded to a basic HTTPS connection attempt."
-          : httpsStatus === "warning"
-            ? "The browser could not confirm a basic HTTPS connection."
-            : "Checking whether the website can be reached over HTTPS.",
-      label:
-        httpsStatus === "success"
-          ? "Reachable"
-          : httpsStatus === "warning"
-            ? "Could not confirm"
-            : statusLabel(httpsStatus),
-      className: httpsStatus,
-    },
-    {
-      name: "DNS",
-      description:
-        dnsStatus === "success"
-          ? `${dnsResult.ipv4.length} IPv4 record(s) and ${dnsResult.mailServers.length} mail server record(s) found.`
-          : dnsStatus === "warning"
-            ? "StudentScans could not confirm public A-records for this domain."
-            : "Looking up public DNS records.",
-      label: statusLabel(dnsStatus),
-      className: dnsStatus,
-    },
-    {
-      name: "Security Headers",
-      description: "This check will be connected in a later version.",
-      label: "Pending",
-      className: "pending",
-    },
-    {
-      name: "SPF",
-      description: "This check will be connected in a later version.",
-      label: "Pending",
-      className: "pending",
-    },
-    {
-      name: "DMARC",
-      description: "This check will be connected in a later version.",
-      label: "Pending",
-      className: "pending",
-    },
-  ];
+  return <main className="page"><section className="hero">
+    <span className="badge">Beta</span>
+    <h1>StudentScans</h1>
+    <p className="lead">Enter a website to run a basic external security overview.</p>
 
-  return (
-    <main className="page">
-      <section className="hero">
-        <span className="badge">Beta</span>
-        <h1>StudentScans</h1>
-        <p className="lead">Enter a website to run a basic external security overview.</p>
+    <div className="scan-form">
+      <label htmlFor="domain">Website domain</label>
+      <input id="domain" className="domain-input" placeholder="example.com"
+        value={domain} disabled={scanning} onChange={e=>setDomain(e.target.value)} />
+      <button onClick={()=>void startScan()} disabled={scanning}>
+        {scanning ? "Scanning..." : "Start scan"}
+      </button>
+    </div>
+    {message && <p className="error-message">{message}</p>}
 
-        <div className="scan-form">
-          <label htmlFor="domain">Website domain</label>
-          <input
-            id="domain"
-            className="domain-input"
-            placeholder="example.com"
-            value={domain}
-            disabled={status === "scanning"}
-            onChange={(event) => setDomain(event.target.value)}
-          />
-          <button
-            type="button"
-            onClick={() => void startScan()}
-            disabled={status === "scanning"}
-          >
-            {status === "scanning" ? "Scanning..." : "Start scan"}
-          </button>
-        </div>
+    {scanning && <section className="scan-panel">
+      <div className="scan-heading"><h2>Scanning {target}</h2><span>{progress}%</span></div>
+      <div className="progress-track"><div className="progress-bar" style={{width:`${progress}%`}} /></div>
+      <p className="scan-step">
+        {progress<25 ? "Starting scan..." : progress<60 ? "Looking up DNS records..." :
+         progress<80 ? "Checking SPF policy..." : "Preparing results..."}
+      </p>
+    </section>}
 
-        {message && <p className="error-message">{message}</p>}
+    {complete && <section className="results-panel">
+      <div className="results-heading">
+        <div><p className="section-label">Scan complete</p><h2>{target}</h2></div>
+        <button className="secondary-button" onClick={reset}>New scan</button>
+      </div>
 
-        {status === "scanning" && (
-          <section className="scan-panel">
-            <div className="scan-heading">
-              <h2>Scanning {scannedDomain}</h2>
-              <span>{progress}%</span>
-            </div>
-            <div className="progress-track">
-              <div className="progress-bar" style={{ width: `${progress}%` }} />
-            </div>
-            <p className="scan-step">
-              {progress < 30 && "Starting scan..."}
-              {progress >= 30 && progress < 55 && "Checking HTTPS..."}
-              {progress >= 55 && progress < 90 && "Looking up DNS records..."}
-              {progress >= 90 && "Preparing results..."}
-            </p>
-          </section>
-        )}
+      <p className="notice">
+        StudentScans currently performs basic HTTPS reachability and public DNS, MX and SPF lookups.
+      </p>
 
-        {status === "complete" && (
-          <section className="results-panel">
-            <div className="results-heading">
-              <div>
-                <p className="section-label">Scan complete</p>
-                <h2>{scannedDomain}</h2>
-              </div>
-              <button type="button" className="secondary-button" onClick={resetScan}>
-                New scan
-              </button>
-            </div>
+      <div className="check-list">
+        <article className="check-card"><div><h3>HTTPS</h3>
+          <p>{https==="success" ? "The website responded to a basic HTTPS connection attempt." :
+             "The browser could not confirm a basic HTTPS connection."}</p>
+        </div><span className={`check-status ${https}`}>{label(https,"Reachable")}</span></article>
 
-            <p className="notice">
-              StudentScans currently performs basic HTTPS reachability and public DNS lookups.
-            </p>
+        <article className="check-card"><div><h3>DNS</h3>
+          <p>{dns==="success" ? `${ips.length} IPv4 record(s) and ${mx.length} mail server record(s) found.` :
+             "Public A-records could not be confirmed."}</p>
+          {ips.length>0 && <div className="record-details">
+            <p><strong>IPv4:</strong> {ips.join(", ")}</p>
+            {mx.length>0 && <p><strong>MX:</strong> {mx.slice(0,3).join(", ")}</p>}
+          </div>}
+        </div><span className={`check-status ${dns}`}>{dns==="warning" ? "Could not confirm" : label(dns)}</span></article>
 
-            <div className="check-list">
-              {checks.map((check) => (
-                <article className="check-card" key={check.name}>
-                  <div>
-                    <h3>{check.name}</h3>
-                    <p>{check.description}</p>
+        <article className="check-card"><div><h3>SPF</h3>
+          <p>{spf==="success" ? "An SPF policy was found in the domain's public TXT records." :
+             "No SPF policy was found in the public TXT records."}</p>
+          {spfRecord && <div className="record-details"><p><strong>SPF record:</strong> {spfRecord}</p></div>}
+        </div><span className={`check-status ${spf}`}>{label(spf)}</span></article>
 
-                    {check.name === "DNS" && dnsResult.ipv4.length > 0 && (
-                      <div className="dns-details">
-                        <p><strong>IPv4:</strong> {dnsResult.ipv4.join(", ")}</p>
-                        {dnsResult.mailServers.length > 0 && (
-                          <p><strong>MX:</strong> {dnsResult.mailServers.slice(0, 3).join(", ")}</p>
-                        )}
-                      </div>
-                    )}
-                  </div>
-
-                  <span className={`check-status ${check.className}`}>
-                    {check.label}
-                  </span>
-                </article>
-              ))}
-            </div>
-          </section>
-        )}
-      </section>
-    </main>
-  );
+        {["Security Headers","DMARC"].map(name=><article className="check-card" key={name}>
+          <div><h3>{name}</h3><p>This check will be connected in a later version.</p></div>
+          <span className="check-status pending">Pending</span>
+        </article>)}
+      </div>
+    </section>}
+  </section></main>;
 }

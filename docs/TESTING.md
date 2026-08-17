@@ -1,0 +1,21 @@
+# StudentScans v1.0 Manual Test Checklist
+
+- [ ] Empty/invalid domain is rejected
+- [ ] example.com is accepted
+- [ ] https://example.com is normalized
+- [ ] DNS results display
+- [ ] SPF result displays
+- [ ] DMARC result displays
+- [ ] Security Headers completes with backend running
+- [ ] UI reports unavailable backend when backend is stopped
+- [ ] TLS protocol displays
+- [ ] Certificate subject displays
+- [ ] Certificate issuer displays
+- [ ] Certificate dates display
+- [ ] Days remaining displays
+- [ ] Score breakdown adds up correctly
+- [ ] Recommendations match missing checks
+- [ ] Disclaimer is visible
+- [ ] New scan resets results
+- [ ] Enter key starts scan
+- [ ] Scan duration is displayed

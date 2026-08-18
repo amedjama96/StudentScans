@@ -85,4 +85,52 @@ app.get("/api/tls", (req, res) => {
   });
 });
 
+app.get("/api/redirect", async (req, res) => {
+  const domain = cleanDomain(String(req.query.domain || ""));
+  if (!domain || !domain.includes(".")) return res.status(400).json({ error: "Invalid domain" });
+
+  try {
+    const initial = await fetch(`http://${domain}`, {
+      method: "GET",
+      redirect: "manual",
+      signal: AbortSignal.timeout(8000),
+    });
+
+    const location = initial.headers.get("location") || "";
+    const redirected = [301, 302, 303, 307, 308].includes(initial.status);
+
+    let finalUrl = `http://${domain}`;
+    let finalStatus = initial.status;
+    let usesHttps = false;
+
+    if (redirected && location) {
+      const absolute = new URL(location, `http://${domain}`).toString();
+
+      const finalResponse = await fetch(absolute, {
+        method: "GET",
+        redirect: "follow",
+        signal: AbortSignal.timeout(8000),
+      });
+
+      finalUrl = finalResponse.url || absolute;
+      finalStatus = finalResponse.status;
+      usesHttps = finalUrl.startsWith("https://");
+    } else {
+      usesHttps = finalUrl.startsWith("https://");
+    }
+
+    res.json({
+      domain,
+      initialStatus: initial.status,
+      redirected,
+      location,
+      finalUrl,
+      finalStatus,
+      usesHttps,
+    });
+  } catch {
+    res.status(502).json({ error: "Could not check HTTP redirect" });
+  }
+});
+
 app.listen(3001, () => console.log("StudentScans backend running on http://localhost:3001"));

@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 
 type HeaderResult={name:string;found:boolean;value:string};
-type TlsResult={protocol:string|null;subject:string;issuer:string;validFrom:string;validTo:string;daysRemaining:number;authorized:boolean;authorizationError:string};
+type TlsResult={protocol:string|null;protocolRating:string;subject:string;issuer:string;validFrom:string;validTo:string;daysRemaining:number;authorized:boolean;authorizationError:string;cipherName:string;cipherVersion:string;cipherStandardName:string;ephemeralKeyInfo:{type?:string;name?:string;size?:number}|null};
 type RedirectResult={initialStatus:number;redirected:boolean;location:string;finalUrl:string;finalStatus:number;usesHttps:boolean};
 
 const clean=(v:string)=>v.trim().replace(/^https?:\/\//i,"").replace(/\/.*$/,"").toLowerCase();
@@ -24,6 +24,19 @@ const scoreClass=(s:number)=>s>=80?"score-good":s>=50?"score-medium":"score-low"
 const risk=(s:number)=>s>=80?"Low":s>=50?"Moderate":"Elevated";
 const fmt=(v:string)=>new Intl.DateTimeFormat("en-GB",{day:"2-digit",month:"short",year:"numeric"}).format(new Date(v));
 
+function tlsStatus(t:TlsResult|null){
+  if(!t||!t.authorized)return "Check needed";
+  if(t.daysRemaining<=0)return "Expired";
+  if(t.protocolRating==="Outdated")return "Weak";
+  if(t.daysRemaining<=30)return "Renew soon";
+  return "Strong";
+}
+function tlsClass(t:TlsResult|null){
+  if(!t||!t.authorized||t.daysRemaining<=0||t.protocolRating==="Outdated")return "fail";
+  if(t.daysRemaining<=30||t.protocolRating==="Acceptable")return "warn";
+  return "ok";
+}
+
 export default function App(){
   const[domain,setDomain]=useState(""),[target,setTarget]=useState(""),[msg,setMsg]=useState("");
   const[busy,setBusy]=useState(false),[done,setDone]=useState(false);
@@ -35,8 +48,7 @@ export default function App(){
 
   function reset(){
     setDone(false);setMsg("");setTarget("");setIps([]);setSpf("");setDmarc("");setPolicy("");
-    setHeaders([]);setBackend(true);setTls(null);setTlsOk(true);setRedirect(null);setRedirectOk(true);
-    setScanTime("");setDuration(0);
+    setHeaders([]);setBackend(true);setTls(null);setTlsOk(true);setRedirect(null);setRedirectOk(true);setScanTime("");setDuration(0);
   }
 
   async function scan(){
@@ -49,29 +61,18 @@ export default function App(){
     try{
       const[a,t,dm]=await Promise.all([dns(d,"A"),dns(d,"TXT"),dns(`_dmarc.${d}`,"TXT")]);
       setIps((a.Answer??[]).filter((x:any)=>x.type===1).map((x:any)=>x.data));
-
       const txt:string[]=(t.Answer??[]).filter((x:any)=>x.type===16).map((x:any)=>x.data.replace(/^"|"$/g,""));
       setSpf(txt.find(x=>x.toLowerCase().startsWith("v=spf1"))??"");
-
       const dr:string[]=(dm.Answer??[]).filter((x:any)=>x.type===16).map((x:any)=>x.data.replace(/^"|"$/g,""));
       const rec=dr.find(x=>x.toLowerCase().startsWith("v=dmarc1"))??"";
-      setDmarc(rec);
-      setPolicy(rec.match(/(?:^|;)\s*p=([^;]+)/i)?.[1]?.trim().toLowerCase()??"");
+      setDmarc(rec);setPolicy(rec.match(/(?:^|;)\s*p=([^;]+)/i)?.[1]?.trim().toLowerCase()??"");
     }catch{setIps([]);setSpf("");setDmarc("");setPolicy("");}
 
-    const headerPromise = timedFetch(`http://localhost:3001/api/headers?domain=${encodeURIComponent(d)}`)
-      .then(async r=>{ if(!r.ok) throw Error(); setHeaders((await r.json()).headers); })
-      .catch(()=>setBackend(false));
+    const hp=timedFetch(`http://localhost:3001/api/headers?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setHeaders((await r.json()).headers)}).catch(()=>setBackend(false));
+    const tp=timedFetch(`http://localhost:3001/api/tls?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setTls(await r.json())}).catch(()=>setTlsOk(false));
+    const rp=timedFetch(`http://localhost:3001/api/redirect?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setRedirect(await r.json())}).catch(()=>setRedirectOk(false));
 
-    const tlsPromise = timedFetch(`http://localhost:3001/api/tls?domain=${encodeURIComponent(d)}`)
-      .then(async r=>{ if(!r.ok) throw Error(); setTls(await r.json()); })
-      .catch(()=>setTlsOk(false));
-
-    const redirectPromise = timedFetch(`http://localhost:3001/api/redirect?domain=${encodeURIComponent(d)}`)
-      .then(async r=>{ if(!r.ok) throw Error(); setRedirect(await r.json()); })
-      .catch(()=>setRedirectOk(false));
-
-    await Promise.all([headerPromise,tlsPromise,redirectPromise]);
+    await Promise.all([hp,tp,rp]);
 
     setDuration(Number(((performance.now()-started)/1000).toFixed(1)));
     setScanTime(new Intl.DateTimeFormat("en-GB",{dateStyle:"medium",timeStyle:"short"}).format(new Date()));
@@ -83,13 +84,20 @@ export default function App(){
   const dnsPoints=ips.length?10:0;
   const spfPoints=spf?10:0;
   const dmarcPoints=dmarc?(policy==="reject"?20:policy==="quarantine"?15:10):0;
-  const tlsPoints=tls&&tls.authorized&&tls.daysRemaining>0?(tls.daysRemaining<=30?15:20):0;
+
+  let tlsPoints=0;
+  if(tls&&tls.authorized&&tls.daysRemaining>0){
+    tlsPoints+=tls.protocol==="TLSv1.3"?12:tls.protocol==="TLSv1.2"?8:0;
+    tlsPoints+=tls.daysRemaining>30?5:3;
+    if(tls.cipherName&&tls.cipherName!=="Unknown")tlsPoints+=3;
+  }
+  tlsPoints=Math.min(20,tlsPoints);
+
   const redirectPoints=redirectOk&&redirect?.usesHttps?10:0;
   const score=Math.min(100,dnsPoints+spfPoints+dmarcPoints+headerPoints+tlsPoints+redirectPoints);
 
   const recs=useMemo(()=>{
     const r:string[]=[];
-
     if(!spf)r.push("Add an SPF record to define which mail servers may send email for this domain.");
     if(!dmarc)r.push("Add a DMARC record to improve protection against email spoofing.");
     else if(policy==="none")r.push("DMARC is monitoring only. Consider moving toward quarantine or reject after reviewing reports.");
@@ -102,10 +110,14 @@ export default function App(){
       if(h.name==="X-Content-Type-Options")r.push("Consider adding X-Content-Type-Options: nosniff.");
     });
 
-    if(!tlsOk||!tls)r.push("TLS certificate details could not be confirmed.");
-    else if(!tls.authorized)r.push("The TLS certificate could not be verified by the local Node.js trust store.");
-    else if(tls.daysRemaining<0)r.push("The TLS certificate appears to be expired and should be renewed immediately.");
-    else if(tls.daysRemaining<=30)r.push(`The TLS certificate expires in ${tls.daysRemaining} days. Plan certificate renewal.`);
+    if(!tlsOk||!tls)r.push("TLS configuration could not be confirmed.");
+    else{
+      if(!tls.authorized)r.push("The TLS certificate could not be verified by the local Node.js trust store.");
+      if(tls.daysRemaining<0)r.push("The TLS certificate appears to be expired and should be renewed immediately.");
+      else if(tls.daysRemaining<=30)r.push(`The TLS certificate expires in ${tls.daysRemaining} days. Plan certificate renewal.`);
+      if(tls.protocolRating==="Outdated")r.push(`The negotiated protocol is ${tls.protocol}. Consider disabling outdated TLS versions.`);
+      else if(tls.protocolRating==="Acceptable")r.push("TLS 1.2 is still widely supported, but prefer TLS 1.3 where possible.");
+    }
 
     if(!redirectOk||!redirect)r.push("HTTP-to-HTTPS redirect behavior could not be confirmed.");
     else if(!redirect.usesHttps)r.push("HTTP traffic did not end on HTTPS. Consider redirecting all HTTP requests to HTTPS.");
@@ -116,14 +128,14 @@ export default function App(){
   const completed=[ips.length>0,!!spf,!!dmarc,backend&&headers.length>0,tlsOk&&!!tls,redirectOk&&!!redirect].filter(Boolean).length;
 
   return <main><section className="hero">
-    <div className="brand-row"><span className="badge">Phase 2</span><span className="version">v1.1-dev</span></div>
+    <div className="brand-row"><span className="badge">Phase 2</span><span className="version">v1.2-dev</span></div>
     <h1>StudentScans</h1>
-    <p className="lead">A small external security overview for domains, now with HTTP-to-HTTPS redirect analysis.</p>
+    <p className="lead">External domain security checks with deeper TLS analysis.</p>
 
-    <div className="form"><label>Website domain</label><input placeholder="example.com" value={domain} onChange={e=>setDomain(e.target.value)} disabled={busy} onKeyDown={e=>{if(e.key==="Enter"&&!busy)void scan();}}/><button onClick={()=>void scan()} disabled={busy}>{busy?"Scanning...":"Start scan"}</button></div>
+    <div className="form"><label>Website domain</label><input placeholder="example.com" value={domain} onChange={e=>setDomain(e.target.value)} disabled={busy}/><button onClick={()=>void scan()} disabled={busy}>{busy?"Scanning...":"Start scan"}</button></div>
     {msg&&<p className="error">{msg}</p>}
 
-    {busy&&<section className="panel"><h2>Scanning {target}...</h2><p>Checking DNS, email security, HTTP headers, TLS and redirect behavior.</p></section>}
+    {busy&&<section className="panel"><h2>Scanning {target}...</h2><p>Checking DNS, email security, HTTP headers, TLS configuration and redirect behavior.</p></section>}
 
     {done&&<section className="panel">
       <div className="top"><div><p className="eyebrow">SCAN COMPLETE</p><h2>{target}</h2><p className="meta">{scanTime} • {duration}s</p></div><div className="actions"><button className="secondary" onClick={reset}>New scan</button><div className={`score ${scoreClass(score)}`}><b>{score}</b><span>/100</span><small>Security score</small></div></div></div>
@@ -139,7 +151,22 @@ export default function App(){
         <article><div><h3>SPF</h3><p>{spf?"SPF policy found.":"No SPF policy found."}</p></div><span className={spf?"ok":"fail"}>{spf?"Found":"Not found"}</span></article>
         <article><div><h3>DMARC</h3><p>{dmarc?`DMARC policy: ${policy||"not specified"}.`:"No DMARC policy found."}</p></div><span className={dmarc?"ok":"fail"}>{dmarc?"Found":"Not found"}</span></article>
         <article><div><h3>Security Headers</h3><p>{backend?`${foundHeaders} of ${headers.length} checked headers were found.`:"The local backend could not complete this check."}</p></div><span className={backend?"ok":"fail"}>{backend?"Inspected":"Unavailable"}</span></article>
-        <article><div><h3>TLS Certificate</h3>{tls?<><p>{tls.authorized?"Certificate chain verified.":"Certificate chain could not be verified."}</p><div className="details tls"><p><b>Protocol:</b> {tls.protocol||"Unknown"}</p><p><b>Subject:</b> {tls.subject}</p><p><b>Issuer:</b> {tls.issuer}</p><p><b>Valid from:</b> {fmt(tls.validFrom)}</p><p><b>Valid to:</b> {fmt(tls.validTo)}</p><p><b>Days remaining:</b> {tls.daysRemaining}</p></div></>:<p>TLS certificate details could not be confirmed.</p>}</div><span className={tls?.authorized&&tls.daysRemaining>0?"ok":"fail"}>{tls?.authorized&&tls.daysRemaining>0?"Valid":"Check needed"}</span></article>
+
+        <article><div><h3>TLS Analysis</h3>
+          {tls?<><p>{tls.authorized?"Certificate chain verified.":"Certificate chain could not be verified."}</p>
+          <div className="tls-rating-row"><span className={tlsClass(tls)}>{tlsStatus(tls)}</span><span className="protocol-rating">{tls.protocolRating}</span></div>
+          <div className="details tls">
+            <p><b>Protocol:</b> {tls.protocol||"Unknown"}</p>
+            <p><b>Cipher:</b> {tls.cipherStandardName||tls.cipherName}</p>
+            <p><b>Cipher version:</b> {tls.cipherVersion}</p>
+            <p><b>Subject:</b> {tls.subject}</p>
+            <p><b>Issuer:</b> {tls.issuer}</p>
+            <p><b>Valid from:</b> {fmt(tls.validFrom)}</p>
+            <p><b>Valid to:</b> {fmt(tls.validTo)}</p>
+            <p><b>Days remaining:</b> {tls.daysRemaining}</p>
+            {tls.ephemeralKeyInfo?.type&&<p><b>Ephemeral key:</b> {tls.ephemeralKeyInfo.type}{tls.ephemeralKeyInfo.name?` / ${tls.ephemeralKeyInfo.name}`:""}{tls.ephemeralKeyInfo.size?` / ${tls.ephemeralKeyInfo.size} bits`:""}</p>}
+          </div></>:<p>TLS configuration could not be confirmed.</p>}</div><span className={tlsClass(tls)}>{tlsStatus(tls)}</span></article>
+
         <article><div><h3>HTTPS Redirect</h3>{redirect?<><p>{redirect.usesHttps?"HTTP traffic ends on HTTPS.":"HTTP traffic did not end on HTTPS."}</p><div className="details"><p><b>Initial status:</b> {redirect.initialStatus}</p><p><b>Redirected:</b> {redirect.redirected?"Yes":"No"}</p><p><b>Final URL:</b> {redirect.finalUrl}</p><p><b>Final status:</b> {redirect.finalStatus}</p></div></>:<p>Redirect behavior could not be confirmed.</p>}</div><span className={redirect?.usesHttps?"ok":"fail"}>{redirect?.usesHttps?"HTTPS enforced":"Check needed"}</span></article>
       </div>
 

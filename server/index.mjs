@@ -53,11 +53,23 @@ app.get("/api/tls", (req, res) => {
       const cert = socket.getPeerCertificate();
       if (!cert || !cert.valid_to) throw new Error("No certificate");
 
+      const cipher = socket.getCipher();
+      const protocol = socket.getProtocol();
       const validTo = new Date(cert.valid_to);
       const daysRemaining = Math.ceil((validTo.getTime() - Date.now()) / 86400000);
 
-      const result = {
-        protocol: socket.getProtocol(),
+      let protocolRating = "Unknown";
+      if (protocol === "TLSv1.3") protocolRating = "Strong";
+      else if (protocol === "TLSv1.2") protocolRating = "Acceptable";
+      else if (protocol) protocolRating = "Outdated";
+
+      res.json({
+        protocol,
+        protocolRating,
+        cipherName: cipher?.name || "Unknown",
+        cipherVersion: cipher?.version || "Unknown",
+        cipherStandardName: cipher?.standardName || "",
+        ephemeralKeyInfo: typeof socket.getEphemeralKeyInfo === "function" ? socket.getEphemeralKeyInfo() : null,
         subject: cert.subject?.CN || domain,
         issuer: cert.issuer?.O || cert.issuer?.CN || "Unknown issuer",
         validFrom: new Date(cert.valid_from).toISOString(),
@@ -65,13 +77,12 @@ app.get("/api/tls", (req, res) => {
         daysRemaining,
         authorized: socket.authorized,
         authorizationError: socket.authorizationError || "",
-      };
+      });
 
       socket.end();
-      res.json(result);
     } catch {
       socket.end();
-      res.status(502).json({ error: "Could not inspect TLS certificate" });
+      res.status(502).json({ error: "Could not inspect TLS configuration" });
     }
   });
 
@@ -105,7 +116,6 @@ app.get("/api/redirect", async (req, res) => {
 
     if (redirected && location) {
       const absolute = new URL(location, `http://${domain}`).toString();
-
       const finalResponse = await fetch(absolute, {
         method: "GET",
         redirect: "follow",
@@ -115,12 +125,9 @@ app.get("/api/redirect", async (req, res) => {
       finalUrl = finalResponse.url || absolute;
       finalStatus = finalResponse.status;
       usesHttps = finalUrl.startsWith("https://");
-    } else {
-      usesHttps = finalUrl.startsWith("https://");
     }
 
     res.json({
-      domain,
       initialStatus: initial.status,
       redirected,
       location,

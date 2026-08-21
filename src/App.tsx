@@ -1,176 +1,97 @@
-import { useMemo, useState } from "react";
+import {useMemo,useState} from "react";
+import "./styles.css";
 
-type HeaderResult={name:string;found:boolean;value:string};
-type TlsResult={protocol:string|null;protocolRating:string;subject:string;issuer:string;validFrom:string;validTo:string;daysRemaining:number;authorized:boolean;authorizationError:string;cipherName:string;cipherVersion:string;cipherStandardName:string;ephemeralKeyInfo:{type?:string;name?:string;size?:number}|null};
-type RedirectResult={initialStatus:number;redirected:boolean;location:string;finalUrl:string;finalStatus:number;usesHttps:boolean};
+type Header={name:string;value:string;found:boolean;rating:"Good"|"Review"|"Missing";findings:string[]};
+type TLS={protocol:string|null;protocolRating:string;cipherName:string;cipherVersion:string;cipherStandardName:string;subject:string;issuer:string;validFrom:string;validTo:string;daysRemaining:number;authorized:boolean};
+type Redirect={initialStatus:number;redirected:boolean;finalUrl:string;finalStatus:number;usesHttps:boolean};
 
 const clean=(v:string)=>v.trim().replace(/^https?:\/\//i,"").replace(/\/.*$/,"").toLowerCase();
-const validDomain=(v:string)=>/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(v);
-
-async function dns(domain:string,type:string){
-  const r=await fetch(`https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=${type}`);
-  if(!r.ok)throw Error();
-  return r.json();
-}
-
-async function timedFetch(url:string,ms=9000){
-  const c=new AbortController();
-  const t=window.setTimeout(()=>c.abort(),ms);
-  try{return await fetch(url,{signal:c.signal});}
-  finally{window.clearTimeout(t);}
-}
-
-const scoreClass=(s:number)=>s>=80?"score-good":s>=50?"score-medium":"score-low";
-const risk=(s:number)=>s>=80?"Low":s>=50?"Moderate":"Elevated";
+const valid=(v:string)=>/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(v);
+const badge=(r:string)=>r==="Good"?"ok":r==="Review"?"warn":"fail";
 const fmt=(v:string)=>new Intl.DateTimeFormat("en-GB",{day:"2-digit",month:"short",year:"numeric"}).format(new Date(v));
 
-function tlsStatus(t:TlsResult|null){
-  if(!t||!t.authorized)return "Check needed";
-  if(t.daysRemaining<=0)return "Expired";
-  if(t.protocolRating==="Outdated")return "Weak";
-  if(t.daysRemaining<=30)return "Renew soon";
-  return "Strong";
-}
-function tlsClass(t:TlsResult|null){
-  if(!t||!t.authorized||t.daysRemaining<=0||t.protocolRating==="Outdated")return "fail";
-  if(t.daysRemaining<=30||t.protocolRating==="Acceptable")return "warn";
-  return "ok";
+async function dns(domain:string,type:string){
+ const r=await fetch(`https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=${type}`);
+ if(!r.ok)throw Error(); return r.json();
 }
 
 export default function App(){
-  const[domain,setDomain]=useState(""),[target,setTarget]=useState(""),[msg,setMsg]=useState("");
-  const[busy,setBusy]=useState(false),[done,setDone]=useState(false);
-  const[ips,setIps]=useState<string[]>([]),[spf,setSpf]=useState(""),[dmarc,setDmarc]=useState(""),[policy,setPolicy]=useState("");
-  const[headers,setHeaders]=useState<HeaderResult[]>([]),[backend,setBackend]=useState(true);
-  const[tls,setTls]=useState<TlsResult|null>(null),[tlsOk,setTlsOk]=useState(true);
-  const[redirect,setRedirect]=useState<RedirectResult|null>(null),[redirectOk,setRedirectOk]=useState(true);
-  const[scanTime,setScanTime]=useState(""),[duration,setDuration]=useState(0);
+ const[domain,setDomain]=useState(""); const[target,setTarget]=useState(""); const[error,setError]=useState("");
+ const[busy,setBusy]=useState(false); const[done,setDone]=useState(false);
+ const[ips,setIps]=useState<string[]>([]); const[spf,setSpf]=useState(""); const[dmarc,setDmarc]=useState(""); const[policy,setPolicy]=useState("");
+ const[headers,setHeaders]=useState<Header[]>([]); const[headersOk,setHeadersOk]=useState(true);
+ const[tls,setTls]=useState<TLS|null>(null); const[redirect,setRedirect]=useState<Redirect|null>(null);
 
-  function reset(){
-    setDone(false);setMsg("");setTarget("");setIps([]);setSpf("");setDmarc("");setPolicy("");
-    setHeaders([]);setBackend(true);setTls(null);setTlsOk(true);setRedirect(null);setRedirectOk(true);setScanTime("");setDuration(0);
-  }
+ async function scan(){
+   const d=clean(domain);
+   if(!valid(d)){setError("Please enter a valid domain, such as example.com.");return;}
+   setError("");setBusy(true);setDone(false);setTarget(d);setHeaders([]);setTls(null);setRedirect(null);setHeadersOk(true);
 
-  async function scan(){
-    const d=clean(domain);
-    if(!validDomain(d)){setMsg("Please enter a valid domain, such as example.com.");return;}
+   try{
+     const[a,t,dm]=await Promise.all([dns(d,"A"),dns(d,"TXT"),dns(`_dmarc.${d}`,"TXT")]);
+     setIps((a.Answer??[]).filter((x:any)=>x.type===1).map((x:any)=>x.data));
+     const txt=(t.Answer??[]).filter((x:any)=>x.type===16).map((x:any)=>String(x.data).replace(/^"|"$/g,""));
+     setSpf(txt.find((x:string)=>x.toLowerCase().startsWith("v=spf1"))??"");
+     const dr=(dm.Answer??[]).filter((x:any)=>x.type===16).map((x:any)=>String(x.data).replace(/^"|"$/g,""));
+     const rec=dr.find((x:string)=>x.toLowerCase().startsWith("v=dmarc1"))??"";
+     setDmarc(rec); setPolicy(rec.match(/(?:^|;)\s*p=([^;]+)/i)?.[1]?.trim().toLowerCase()??"");
+   }catch{setIps([]);setSpf("");setDmarc("");setPolicy("");}
 
-    const started=performance.now();
-    setMsg("");setTarget(d);setBusy(true);setDone(false);setHeaders([]);setBackend(true);setTls(null);setTlsOk(true);setRedirect(null);setRedirectOk(true);
+   await Promise.all([
+     fetch(`http://localhost:3001/api/headers?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setHeaders((await r.json()).headers)}).catch(()=>setHeadersOk(false)),
+     fetch(`http://localhost:3001/api/tls?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setTls(await r.json())}).catch(()=>setTls(null)),
+     fetch(`http://localhost:3001/api/redirect?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setRedirect(await r.json())}).catch(()=>setRedirect(null))
+   ]);
+   setBusy(false);setDone(true);
+ }
 
-    try{
-      const[a,t,dm]=await Promise.all([dns(d,"A"),dns(d,"TXT"),dns(`_dmarc.${d}`,"TXT")]);
-      setIps((a.Answer??[]).filter((x:any)=>x.type===1).map((x:any)=>x.data));
-      const txt:string[]=(t.Answer??[]).filter((x:any)=>x.type===16).map((x:any)=>x.data.replace(/^"|"$/g,""));
-      setSpf(txt.find(x=>x.toLowerCase().startsWith("v=spf1"))??"");
-      const dr:string[]=(dm.Answer??[]).filter((x:any)=>x.type===16).map((x:any)=>x.data.replace(/^"|"$/g,""));
-      const rec=dr.find(x=>x.toLowerCase().startsWith("v=dmarc1"))??"";
-      setDmarc(rec);setPolicy(rec.match(/(?:^|;)\s*p=([^;]+)/i)?.[1]?.trim().toLowerCase()??"");
-    }catch{setIps([]);setSpf("");setDmarc("");setPolicy("");}
+ const good=headers.filter(h=>h.rating==="Good").length;
+ const review=headers.filter(h=>h.rating==="Review").length;
+ const missing=headers.filter(h=>h.rating==="Missing").length;
+ const headerScore=headersOk&&headers.length?Math.round(((good+review*.5)/headers.length)*30):0;
+ const dnsScore=ips.length?10:0,spfScore=spf?10:0,dmarcScore=dmarc?(policy==="reject"?20:policy==="quarantine"?15:10):0;
+ const tlsScore=tls&&tls.authorized&&tls.daysRemaining>0?(tls.protocol==="TLSv1.3"?20:tls.protocol==="TLSv1.2"?16:8):0;
+ const redirectScore=redirect?.usesHttps?10:0;
+ const score=Math.min(100,dnsScore+spfScore+dmarcScore+headerScore+tlsScore+redirectScore);
 
-    const hp=timedFetch(`http://localhost:3001/api/headers?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setHeaders((await r.json()).headers)}).catch(()=>setBackend(false));
-    const tp=timedFetch(`http://localhost:3001/api/tls?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setTls(await r.json())}).catch(()=>setTlsOk(false));
-    const rp=timedFetch(`http://localhost:3001/api/redirect?domain=${encodeURIComponent(d)}`).then(async r=>{if(!r.ok)throw Error();setRedirect(await r.json())}).catch(()=>setRedirectOk(false));
+ const recs=useMemo(()=>{
+   const r:string[]=[];
+   headers.forEach(h=>{
+     if(h.rating==="Missing")r.push(`${h.name} is missing.`);
+     if(h.rating==="Review")h.findings.forEach(f=>r.push(`${h.name}: ${f}`));
+   });
+   if(!redirect?.usesHttps)r.push("HTTP traffic should redirect to HTTPS.");
+   return r;
+ },[headers,redirect]);
 
-    await Promise.all([hp,tp,rp]);
+ return <main><section className="shell">
+   <div className="tags"><span>Phase 2</span><span>v1.3-dev</span></div>
+   <h1>StudentScans</h1>
+   <p className="lead">External domain security checks with Security Headers v2.</p>
+   <div className="form"><label>Website domain</label><input value={domain} placeholder="example.com" onChange={e=>setDomain(e.target.value)}/><button onClick={scan} disabled={busy}>{busy?"Scanning...":"Start scan"}</button></div>
+   {error&&<p className="error">{error}</p>}
 
-    setDuration(Number(((performance.now()-started)/1000).toFixed(1)));
-    setScanTime(new Intl.DateTimeFormat("en-GB",{dateStyle:"medium",timeStyle:"short"}).format(new Date()));
-    setBusy(false);setDone(true);
-  }
+   {done&&<section className="results">
+     <div className="top"><div><small>SCAN COMPLETE</small><h2>{target}</h2></div><div className={`score ${score>=80?"green":score>=50?"yellow":"red"}`}><b>{score}</b><span>/100</span></div></div>
+     <div className="breakdown"><div>DNS<b>{dnsScore}/10</b></div><div>SPF<b>{spfScore}/10</b></div><div>DMARC<b>{dmarcScore}/20</b></div><div>Headers<b>{headerScore}/30</b></div><div>TLS<b>{tlsScore}/20</b></div><div>Redirect<b>{redirectScore}/10</b></div></div>
 
-  const foundHeaders=headers.filter(h=>h.found).length;
-  const headerPoints=backend&&headers.length?Math.round(foundHeaders/headers.length*30):0;
-  const dnsPoints=ips.length?10:0;
-  const spfPoints=spf?10:0;
-  const dmarcPoints=dmarc?(policy==="reject"?20:policy==="quarantine"?15:10):0;
+     <article className="card"><h3>Security Headers v2</h3><p>{headersOk?`${good} good • ${review} review • ${missing} missing`:"Header inspection unavailable."}</p>
+       <div className="headergrid">{headers.map(h=><div className="header" key={h.name}>
+         <div className="headerline"><b>{h.name}</b><span className={badge(h.rating)}>{h.rating}</span></div>
+         <code>{h.value||"Not present"}</code>
+         {h.findings.map(f=><p className="finding" key={f}>• {f}</p>)}
+       </div>)}</div>
+     </article>
 
-  let tlsPoints=0;
-  if(tls&&tls.authorized&&tls.daysRemaining>0){
-    tlsPoints+=tls.protocol==="TLSv1.3"?12:tls.protocol==="TLSv1.2"?8:0;
-    tlsPoints+=tls.daysRemaining>30?5:3;
-    if(tls.cipherName&&tls.cipherName!=="Unknown")tlsPoints+=3;
-  }
-  tlsPoints=Math.min(20,tlsPoints);
+     <article className="card"><div className="headerline"><h3>TLS Analysis</h3><span className={tls?.authorized?"ok":"fail"}>{tls?.authorized?"Verified":"Check needed"}</span></div>
+       {tls&&<div className="details"><p><b>Protocol:</b> {tls.protocol}</p><p><b>Cipher:</b> {tls.cipherStandardName||tls.cipherName}</p><p><b>Subject:</b> {tls.subject}</p><p><b>Issuer:</b> {tls.issuer}</p><p><b>Valid to:</b> {fmt(tls.validTo)}</p><p><b>Days remaining:</b> {tls.daysRemaining}</p></div>}
+     </article>
 
-  const redirectPoints=redirectOk&&redirect?.usesHttps?10:0;
-  const score=Math.min(100,dnsPoints+spfPoints+dmarcPoints+headerPoints+tlsPoints+redirectPoints);
+     <article className="card"><div className="headerline"><h3>HTTPS Redirect</h3><span className={redirect?.usesHttps?"ok":"fail"}>{redirect?.usesHttps?"HTTPS enforced":"Check needed"}</span></div>
+       {redirect&&<div className="details"><p><b>Initial status:</b> {redirect.initialStatus}</p><p><b>Redirected:</b> {redirect.redirected?"Yes":"No"}</p><p><b>Final URL:</b> {redirect.finalUrl}</p><p><b>Final status:</b> {redirect.finalStatus}</p></div>}
+     </article>
 
-  const recs=useMemo(()=>{
-    const r:string[]=[];
-    if(!spf)r.push("Add an SPF record to define which mail servers may send email for this domain.");
-    if(!dmarc)r.push("Add a DMARC record to improve protection against email spoofing.");
-    else if(policy==="none")r.push("DMARC is monitoring only. Consider moving toward quarantine or reject after reviewing reports.");
-
-    if(!backend)r.push("The local backend could not complete HTTP security-header inspection.");
-    else headers.filter(h=>!h.found).forEach(h=>{
-      if(h.name==="Content-Security-Policy")r.push("Consider adding Content-Security-Policy to reduce the impact of content injection attacks.");
-      if(h.name==="Strict-Transport-Security")r.push("Consider enabling HSTS so browsers use HTTPS for future connections.");
-      if(h.name==="X-Frame-Options")r.push("Consider clickjacking protection with X-Frame-Options or CSP frame-ancestors.");
-      if(h.name==="X-Content-Type-Options")r.push("Consider adding X-Content-Type-Options: nosniff.");
-    });
-
-    if(!tlsOk||!tls)r.push("TLS configuration could not be confirmed.");
-    else{
-      if(!tls.authorized)r.push("The TLS certificate could not be verified by the local Node.js trust store.");
-      if(tls.daysRemaining<0)r.push("The TLS certificate appears to be expired and should be renewed immediately.");
-      else if(tls.daysRemaining<=30)r.push(`The TLS certificate expires in ${tls.daysRemaining} days. Plan certificate renewal.`);
-      if(tls.protocolRating==="Outdated")r.push(`The negotiated protocol is ${tls.protocol}. Consider disabling outdated TLS versions.`);
-      else if(tls.protocolRating==="Acceptable")r.push("TLS 1.2 is still widely supported, but prefer TLS 1.3 where possible.");
-    }
-
-    if(!redirectOk||!redirect)r.push("HTTP-to-HTTPS redirect behavior could not be confirmed.");
-    else if(!redirect.usesHttps)r.push("HTTP traffic did not end on HTTPS. Consider redirecting all HTTP requests to HTTPS.");
-
-    return r;
-  },[spf,dmarc,policy,backend,headers,tlsOk,tls,redirectOk,redirect]);
-
-  const completed=[ips.length>0,!!spf,!!dmarc,backend&&headers.length>0,tlsOk&&!!tls,redirectOk&&!!redirect].filter(Boolean).length;
-
-  return <main><section className="hero">
-    <div className="brand-row"><span className="badge">Phase 2</span><span className="version">v1.2-dev</span></div>
-    <h1>StudentScans</h1>
-    <p className="lead">External domain security checks with deeper TLS analysis.</p>
-
-    <div className="form"><label>Website domain</label><input placeholder="example.com" value={domain} onChange={e=>setDomain(e.target.value)} disabled={busy}/><button onClick={()=>void scan()} disabled={busy}>{busy?"Scanning...":"Start scan"}</button></div>
-    {msg&&<p className="error">{msg}</p>}
-
-    {busy&&<section className="panel"><h2>Scanning {target}...</h2><p>Checking DNS, email security, HTTP headers, TLS configuration and redirect behavior.</p></section>}
-
-    {done&&<section className="panel">
-      <div className="top"><div><p className="eyebrow">SCAN COMPLETE</p><h2>{target}</h2><p className="meta">{scanTime} • {duration}s</p></div><div className="actions"><button className="secondary" onClick={reset}>New scan</button><div className={`score ${scoreClass(score)}`}><b>{score}</b><span>/100</span><small>Security score</small></div></div></div>
-
-      <div className="summary"><div><span>Risk level</span><strong className={scoreClass(score)}>{risk(score)}</strong></div><div><span>Check categories completed</span><strong>{completed}/6</strong></div><div><span>Recommendations</span><strong>{recs.length}</strong></div></div>
-
-      <div className="notice">This educational score only reflects the checks shown below. It is not a vulnerability assessment, penetration test, or proof that a website is secure.</div>
-
-      <div className="breakdown"><div>DNS <b>{dnsPoints}/10</b></div><div>SPF <b>{spfPoints}/10</b></div><div>DMARC <b>{dmarcPoints}/20</b></div><div>Headers <b>{headerPoints}/30</b></div><div>TLS <b>{tlsPoints}/20</b></div><div>HTTPS Redirect <b>{redirectPoints}/10</b></div></div>
-
-      <div className="cards">
-        <article><div><h3>DNS</h3><p>{ips.length?`${ips.length} IPv4 record(s) found.`:"No IPv4 records confirmed."}</p></div><span className={ips.length?"ok":"fail"}>{ips.length?"Found":"Not found"}</span></article>
-        <article><div><h3>SPF</h3><p>{spf?"SPF policy found.":"No SPF policy found."}</p></div><span className={spf?"ok":"fail"}>{spf?"Found":"Not found"}</span></article>
-        <article><div><h3>DMARC</h3><p>{dmarc?`DMARC policy: ${policy||"not specified"}.`:"No DMARC policy found."}</p></div><span className={dmarc?"ok":"fail"}>{dmarc?"Found":"Not found"}</span></article>
-        <article><div><h3>Security Headers</h3><p>{backend?`${foundHeaders} of ${headers.length} checked headers were found.`:"The local backend could not complete this check."}</p></div><span className={backend?"ok":"fail"}>{backend?"Inspected":"Unavailable"}</span></article>
-
-        <article><div><h3>TLS Analysis</h3>
-          {tls?<><p>{tls.authorized?"Certificate chain verified.":"Certificate chain could not be verified."}</p>
-          <div className="tls-rating-row"><span className={tlsClass(tls)}>{tlsStatus(tls)}</span><span className="protocol-rating">{tls.protocolRating}</span></div>
-          <div className="details tls">
-            <p><b>Protocol:</b> {tls.protocol||"Unknown"}</p>
-            <p><b>Cipher:</b> {tls.cipherStandardName||tls.cipherName}</p>
-            <p><b>Cipher version:</b> {tls.cipherVersion}</p>
-            <p><b>Subject:</b> {tls.subject}</p>
-            <p><b>Issuer:</b> {tls.issuer}</p>
-            <p><b>Valid from:</b> {fmt(tls.validFrom)}</p>
-            <p><b>Valid to:</b> {fmt(tls.validTo)}</p>
-            <p><b>Days remaining:</b> {tls.daysRemaining}</p>
-            {tls.ephemeralKeyInfo?.type&&<p><b>Ephemeral key:</b> {tls.ephemeralKeyInfo.type}{tls.ephemeralKeyInfo.name?` / ${tls.ephemeralKeyInfo.name}`:""}{tls.ephemeralKeyInfo.size?` / ${tls.ephemeralKeyInfo.size} bits`:""}</p>}
-          </div></>:<p>TLS configuration could not be confirmed.</p>}</div><span className={tlsClass(tls)}>{tlsStatus(tls)}</span></article>
-
-        <article><div><h3>HTTPS Redirect</h3>{redirect?<><p>{redirect.usesHttps?"HTTP traffic ends on HTTPS.":"HTTP traffic did not end on HTTPS."}</p><div className="details"><p><b>Initial status:</b> {redirect.initialStatus}</p><p><b>Redirected:</b> {redirect.redirected?"Yes":"No"}</p><p><b>Final URL:</b> {redirect.finalUrl}</p><p><b>Final status:</b> {redirect.finalStatus}</p></div></>:<p>Redirect behavior could not be confirmed.</p>}</div><span className={redirect?.usesHttps?"ok":"fail"}>{redirect?.usesHttps?"HTTPS enforced":"Check needed"}</span></article>
-      </div>
-
-      <section className="recommend"><h2>Recommendations</h2>{recs.length?recs.map((r,i)=><div className="rec" key={r}><b>{i+1}</b><p>{r}</p></div>):<p>No recommendations generated.</p>}</section>
-    </section>}
-  </section></main>;
+     <article className="card"><h3>Recommendations</h3>{recs.length?recs.map((r,i)=><div className="rec" key={i}><b>{i+1}</b><span>{r}</span></div>):<p>No recommendations generated.</p>}</article>
+   </section>}
+ </section></main>
 }

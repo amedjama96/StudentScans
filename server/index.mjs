@@ -5,113 +5,133 @@ import tls from "tls";
 const app = express();
 app.use(cors());
 
-const cleanDomain = (value = "") =>
-  value.trim().replace(/^https?:\/\//i, "").replace(/\/.*$/, "").toLowerCase();
+const clean = (v="") => v.trim().replace(/^https?:\/\//i,"").replace(/\/.*$/,"").toLowerCase();
 
-function analyzeHeaders(headers) {
-  const get = (name) => headers.get(name) || "";
-  const csp = get("content-security-policy");
-  const hsts = get("strict-transport-security");
-  const xfo = get("x-frame-options");
-  const xcto = get("x-content-type-options");
-
-  const cspFindings = csp ? [
-    csp.includes("'unsafe-inline'") ? "Allows 'unsafe-inline'." : "",
-    csp.includes("'unsafe-eval'") ? "Allows 'unsafe-eval'." : "",
-    !/(^|;)\s*frame-ancestors\b/i.test(csp) ? "No frame-ancestors directive detected." : "",
-  ].filter(Boolean) : [];
-
-  const maxAgeMatch = hsts.match(/max-age\s*=\s*(\d+)/i);
-  const maxAge = maxAgeMatch ? Number(maxAgeMatch[1]) : null;
-  const hstsFindings = hsts ? [
-    maxAge !== null && maxAge < 15552000 ? "HSTS max-age is shorter than 180 days." : "",
-    !/includesubdomains/i.test(hsts) ? "includeSubDomains is not enabled." : "",
-  ].filter(Boolean) : [];
-
-  const result = [
-    {name:"Content-Security-Policy", value:csp, findings:cspFindings},
-    {name:"Strict-Transport-Security", value:hsts, findings:hstsFindings},
-    {name:"X-Frame-Options", value:xfo, findings:xfo && !["DENY","SAMEORIGIN"].includes(xfo.trim().toUpperCase()) ? ["Unexpected X-Frame-Options value."] : []},
-    {name:"X-Content-Type-Options", value:xcto, findings:xcto && xcto.trim().toLowerCase() !== "nosniff" ? ["Expected value: nosniff."] : []},
-  ];
-
-  return result.map(h => ({
-    ...h,
-    found: Boolean(h.value),
-    rating: !h.value ? "Missing" : h.findings.length ? "Review" : "Good",
-  }));
+async function doh(name,type){
+  const r = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(name)}&type=${type}`, {signal:AbortSignal.timeout(8000)});
+  if(!r.ok) throw new Error();
+  return r.json();
 }
 
-app.get("/api/headers", async (req,res) => {
-  const domain = cleanDomain(String(req.query.domain || ""));
-  if (!domain || !domain.includes(".")) return res.status(400).json({error:"Invalid domain"});
-  try {
-    const response = await fetch(`https://${domain}`, {redirect:"follow", signal:AbortSignal.timeout(8000)});
-    res.json({headers: analyzeHeaders(response.headers)});
-  } catch {
-    res.status(502).json({error:"Could not inspect security headers"});
+function txtRecords(data){
+  return (data.Answer ?? []).filter(x=>x.type===16).map(x=>String(x.data).replace(/^"|"$/g,""));
+}
+
+function parseSpf(record=""){
+  if(!record) return {record:"",rating:"Missing",allPolicy:"Missing",includeCount:0,redirect:"",usesPtr:false,findings:[]};
+  const terms=record.trim().split(/\s+/);
+  const all=terms.find(t=>/^(?:[+?~-])?all$/i.test(t))||"";
+  const includeCount=terms.filter(t=>t.toLowerCase().startsWith("include:")).length;
+  const redirect=terms.find(t=>t.toLowerCase().startsWith("redirect="))||"";
+  const usesPtr=terms.some(t=>/^(?:[+?~-])?ptr(?::|$)/i.test(t));
+  let rating="Review", allPolicy="Unknown"; const findings=[];
+
+  if(all==="-all"){rating="Good";allPolicy="Fail (-all)";}
+  else if(all==="~all"){allPolicy="SoftFail (~all)";findings.push("SPF ends with ~all (SoftFail).");}
+  else if(all==="?all"){allPolicy="Neutral (?all)";findings.push("SPF ends with ?all (Neutral).");}
+  else if(all==="+all"||all==="all"){rating="Weak";allPolicy="Pass all (+all)";findings.push("SPF allows all senders with +all.");}
+  else findings.push("No explicit all mechanism detected.");
+
+  if(usesPtr) findings.push("SPF uses the deprecated ptr mechanism.");
+  if(includeCount>8) findings.push("Many include mechanisms may approach the SPF DNS lookup limit.");
+
+  return {record,rating,allPolicy,includeCount,redirect,usesPtr,findings};
+}
+
+function parseDmarc(record=""){
+  if(!record) return {record:"",rating:"Missing",policy:"Missing",subdomainPolicy:"",pct:null,rua:"",ruf:"",adkim:"",aspf:"",findings:[]};
+
+  const tags={};
+  for(const part of record.split(";").map(x=>x.trim()).filter(Boolean)){
+    const i=part.indexOf("=");
+    if(i>0) tags[part.slice(0,i).trim().toLowerCase()]=part.slice(i+1).trim();
   }
+
+  const policy=(tags.p||"").toLowerCase();
+  const subdomainPolicy=(tags.sp||"").toLowerCase();
+  const pct=tags.pct ? Number(tags.pct) : 100;
+  const rua=tags.rua||"", ruf=tags.ruf||"";
+  const adkim=(tags.adkim||"r").toLowerCase();
+  const aspf=(tags.aspf||"r").toLowerCase();
+  let rating="Review"; const findings=[];
+
+  if(policy==="reject") rating="Good";
+  else if(policy==="quarantine") findings.push("DMARC uses quarantine rather than reject.");
+  else if(policy==="none") findings.push("DMARC is monitoring only with p=none.");
+  else findings.push("DMARC policy could not be interpreted.");
+
+  if(pct<100) findings.push(`DMARC applies to only ${pct}% of messages.`);
+  if(!rua) findings.push("No aggregate reporting address (rua) found.");
+  if(subdomainPolicy==="none") findings.push("Subdomains use p=none.");
+  if(adkim==="r") findings.push("DKIM alignment is relaxed (adkim=r).");
+  if(aspf==="r") findings.push("SPF alignment is relaxed (aspf=r).");
+
+  return {record,rating,policy,subdomainPolicy,pct,rua,ruf,adkim,aspf,findings};
+}
+
+function analyzeHeaders(headers){
+  const names=["content-security-policy","strict-transport-security","x-frame-options","x-content-type-options"];
+  return names.map(key=>{
+    const value=headers.get(key)||"";
+    let rating=value?"Good":"Missing"; const findings=[];
+    if(key==="content-security-policy"&&value){
+      if(value.includes("'unsafe-inline'")) findings.push("Allows 'unsafe-inline'.");
+      if(value.includes("'unsafe-eval'")) findings.push("Allows 'unsafe-eval'.");
+    }
+    if(key==="strict-transport-security"&&value){
+      const m=value.match(/max-age\s*=\s*(\d+)/i);
+      if(m&&Number(m[1])<15552000) findings.push("HSTS max-age is shorter than 180 days.");
+    }
+    if(key==="x-frame-options"&&value&&!["DENY","SAMEORIGIN"].includes(value.trim().toUpperCase())) findings.push("Unexpected X-Frame-Options value.");
+    if(key==="x-content-type-options"&&value.trim().toLowerCase()!=="nosniff") findings.push("Expected nosniff.");
+    if(findings.length) rating="Review";
+    return {name:key.split("-").map(x=>x[0].toUpperCase()+x.slice(1)).join("-"),value,found:Boolean(value),rating,findings};
+  });
+}
+
+app.get("/api/email-security", async (req,res)=>{
+  const domain=clean(String(req.query.domain||""));
+  if(!domain.includes(".")) return res.status(400).json({error:"Invalid domain"});
+  try{
+    const [txt,dm]=await Promise.all([doh(domain,"TXT"),doh(`_dmarc.${domain}`,"TXT")]);
+    const spfRecord=txtRecords(txt).find(x=>x.toLowerCase().startsWith("v=spf1"))||"";
+    const dmarcRecord=txtRecords(dm).find(x=>x.toLowerCase().startsWith("v=dmarc1"))||"";
+    res.json({spf:parseSpf(spfRecord),dmarc:parseDmarc(dmarcRecord)});
+  }catch{res.status(502).json({error:"Email security analysis failed"});}
 });
 
-app.get("/api/tls", (req,res) => {
-  const domain = cleanDomain(String(req.query.domain || ""));
-  if (!domain || !domain.includes(".")) return res.status(400).json({error:"Invalid domain"});
+app.get("/api/headers", async (req,res)=>{
+  const domain=clean(String(req.query.domain||""));
+  try{
+    const r=await fetch(`https://${domain}`,{redirect:"follow",signal:AbortSignal.timeout(8000)});
+    res.json({headers:analyzeHeaders(r.headers)});
+  }catch{res.status(502).json({error:"Header analysis failed"});}
+});
 
-  const socket = tls.connect({host:domain,port:443,servername:domain,rejectUnauthorized:false,timeout:8000}, () => {
-    try {
-      const cert = socket.getPeerCertificate();
-      const cipher = socket.getCipher();
-      const protocol = socket.getProtocol();
-      if (!cert?.valid_to) throw new Error();
-
-      const validTo = new Date(cert.valid_to);
-      const daysRemaining = Math.ceil((validTo.getTime()-Date.now())/86400000);
-      const protocolRating = protocol === "TLSv1.3" ? "Strong" : protocol === "TLSv1.2" ? "Acceptable" : protocol ? "Outdated" : "Unknown";
-
+app.get("/api/tls",(req,res)=>{
+  const domain=clean(String(req.query.domain||""));
+  const socket=tls.connect({host:domain,port:443,servername:domain,rejectUnauthorized:false,timeout:8000},()=>{
+    try{
+      const cert=socket.getPeerCertificate(), cipher=socket.getCipher(), protocol=socket.getProtocol();
+      const validTo=new Date(cert.valid_to);
       res.json({
-        protocol, protocolRating,
-        cipherName:cipher?.name || "Unknown",
-        cipherVersion:cipher?.version || "Unknown",
-        cipherStandardName:cipher?.standardName || "",
-        subject:cert.subject?.CN || domain,
-        issuer:cert.issuer?.O || cert.issuer?.CN || "Unknown issuer",
-        validFrom:new Date(cert.valid_from).toISOString(),
-        validTo:validTo.toISOString(),
-        daysRemaining,
-        authorized:socket.authorized,
-        authorizationError:socket.authorizationError || ""
+        protocol,cipher:cipher?.standardName||cipher?.name||"Unknown",
+        subject:cert.subject?.CN||domain,issuer:cert.issuer?.O||cert.issuer?.CN||"Unknown",
+        validTo:validTo.toISOString(),daysRemaining:Math.ceil((validTo-Date.now())/86400000),
+        authorized:socket.authorized
       });
       socket.end();
-    } catch {
-      socket.end();
-      if (!res.headersSent) res.status(502).json({error:"Could not inspect TLS configuration"});
-    }
+    }catch{socket.end();res.status(502).json({error:"TLS analysis failed"});}
   });
-
-  socket.on("timeout",()=>{socket.destroy(); if(!res.headersSent)res.status(504).json({error:"TLS timeout"});});
   socket.on("error",()=>{if(!res.headersSent)res.status(502).json({error:"TLS connection failed"});});
 });
 
-app.get("/api/redirect", async (req,res) => {
-  const domain = cleanDomain(String(req.query.domain || ""));
-  if (!domain || !domain.includes(".")) return res.status(400).json({error:"Invalid domain"});
-  try {
-    const initial = await fetch(`http://${domain}`, {redirect:"manual",signal:AbortSignal.timeout(8000)});
-    const location = initial.headers.get("location") || "";
-    const redirected = [301,302,303,307,308].includes(initial.status);
-    let finalUrl=`http://${domain}`, finalStatus=initial.status, usesHttps=false;
-
-    if (redirected && location) {
-      const absolute = new URL(location, `http://${domain}`).toString();
-      const finalResponse = await fetch(absolute,{redirect:"follow",signal:AbortSignal.timeout(8000)});
-      finalUrl=finalResponse.url || absolute;
-      finalStatus=finalResponse.status;
-      usesHttps=finalUrl.startsWith("https://");
-    }
-    res.json({initialStatus:initial.status,redirected,finalUrl,finalStatus,usesHttps});
-  } catch {
-    res.status(502).json({error:"Could not check redirect"});
-  }
+app.get("/api/redirect",async(req,res)=>{
+  const domain=clean(String(req.query.domain||""));
+  try{
+    const r=await fetch(`http://${domain}`,{redirect:"follow",signal:AbortSignal.timeout(8000)});
+    res.json({finalUrl:r.url,finalStatus:r.status,usesHttps:r.url.startsWith("https://")});
+  }catch{res.status(502).json({error:"Redirect analysis failed"});}
 });
 
 app.listen(3001,()=>console.log("StudentScans backend running on http://localhost:3001"));
